@@ -1,0 +1,7 @@
+{
+  "name": "Prepara per l'export",
+  "description": "Prima dell'export unisce i tracciati sovrapposti, toglie i punti doppi, arrotonda le coordinate e controlla tutto il font (master compatibili, contorni aperti, componenti mancanti, Unicode doppi…), come faceva Glyphs.",
+  "version": "1.0.0",
+  "init": "prepare-export.js",
+  "function": "start"
+}
