@@ -31,6 +31,7 @@ const SKIP_EXPORT_KEY = "public.skipExportGlyphs";
 const TINY_SEGMENT = 8; // unità: segmenti più corti di così sono sospetti
 const MENU_TITLE = "Prepara per l'export…";
 const MENU_TITLE_EDITOR = "Controlla il font per l'export…";
+const MENU_TITLE_REORDER = "Riordina i glifi di un font esportato…";
 
 // ---------------------------------------------------------------------------
 // Utilità
@@ -471,6 +472,12 @@ class FontAnalyzer {
     }
 
     report.unreachable = await this.unreachableGlyphs(report);
+    report.emptyAxisLabels = [];
+    for (const axis of fc.fontAxes || []) {
+      for (const label of axis.valueLabels || []) {
+        if (!String(label.name ?? "").trim()) report.emptyAxisLabels.push({ axis: axis.label || axis.name, value: label.value });
+      }
+    }
     report.notExported = new Set([...skip, ...report.unreachable]);
 
     for (const [name, g] of report.glyphs) {
@@ -1339,6 +1346,12 @@ class PrepareExportDialog {
       `l'export di Fontra li lascia fuori dal font. Se sono alternative che vuoi nel font, servono le funzioni OpenType (per esempio ss01 o salt) che le usano.</p>` +
       `<div class="names">${this.chips(report.unreachable, 400, { tag: false })}</div>`;
     html += section("Glifi che non finiranno nel font", report.unreachable.length, body, "warn");
+    body =
+      `<p>Un valore dell'asse senza nome finisce nel font come un nome vuoto. In <b>Font Info → Axes</b> scrivi un nome ` +
+      `(per il valore predefinito di solito <b>Normal</b>) e spunta <b>Elidable</b>: i nomi degli stili restano uguali.</p><table>` +
+      report.emptyAxisLabels.map((l) => `<tr><td class="g">${escapeHTML(l.axis)}</td><td>valore ${escapeHTML(l.value)}</td></tr>`).join("") +
+      `</table>`;
+    html += section("Valori degli assi senza nome", report.emptyAxisLabels.length, body, "warn");
     if (report.errors.length) {
       body = `<table>${report.errors.map((e) => `<tr><td class="g">${this.glyphChip(e.name)}</td><td>${escapeHTML(e.message)}</td></tr>`).join("")}</table>`;
       html += section("Glifi che non si sono potuti controllare", report.errors.length, body);
@@ -1476,6 +1489,7 @@ class PrepareExportDialog {
     list("Larghezza negativa", glyphs.filter((g) => g.issues.negativeWidth).map((g) => `${g.name}: ${g.issues.negativeWidth.join(", ")}`));
     list("Vuoti con un carattere", r.emptyWithUnicode);
     list("Non finiranno nel font (nessun carattere, funzione OpenType o componente)", r.unreachable || []);
+    list("Valori degli assi senza nome", (r.emptyAxisLabels || []).map((l) => `${l.axis} ${l.value}`));
     list("Ancore diverse tra i master", glyphs.filter((g) => g.issues.anchors).map((g) => `${g.name}: ` + g.issues.anchors.map((d) => `${d.masters.join(", ")} → ${d.text}`).join(" | ")));
     if (r.errors.length) list("Errori", r.errors.map((e) => `${e.name}: ${e.message}`));
     return lines.join("\n");
@@ -1499,10 +1513,383 @@ class PrepareExportDialog {
 }
 
 // ---------------------------------------------------------------------------
+// Riordina i glifi di un font esportato
+//
+// L'export di Fontra Pak mette i glifi in ordine alfabetico per nome (A, AE,
+// AEacute, Aacute…, a, aacute, ampersand…), e il pannello Glifi di Illustrator
+// li mostra in quell'ordine. Fontra non permette di cambiarlo, quindi il
+// plugin riordina il file già esportato, come lo ordinerebbe Glyphs: maiuscole
+// (ogni lettera con le sue accentate), minuscole, numeri, punteggiatura,
+// simboli, accenti. Lo fa fontTools, che gira nel browser con Pyodide: la
+// prima volta scarica circa 13 MB, poi resta nella cache del browser.
+// Forme, larghezze, kerning e funzioni OpenType non cambiano: prima di dare il
+// file il plugin confronta forme e larghezze glifo per glifo, nel font com'è e
+// nel primo e nell'ultimo stile del font variabile.
+// ---------------------------------------------------------------------------
+
+const PYODIDE_URLS = [
+  "https://cdn.jsdelivr.net/pyodide/v0.29.5/full/",
+  "https://cdn.jsdelivr.net/pyodide/v0.29.3/full/",
+  "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/",
+];
+const REORDER_TAG = "fontra-prepare-export-reorder";
+
+const REORDER_PY = String.raw`
+import io, json, unicodedata
+from fontTools.ttLib import TTFont
+from fontTools.ttLib.reorderGlyphs import reorderGlyphs
+from fontTools.pens.recordingPen import RecordingPen
+
+PUNCTUATION = """period comma colon semicolon ellipsis exclam exclamdown question questiondown
+periodcentered bullet asterisk numbersign slash backslash parenleft parenright braceleft braceright
+bracketleft bracketright hyphen endash emdash underscore quotesinglbase quotedblbase quotedblleft
+quotedblright quoteleft quoteright guillemetleft guillemotleft guillemetright guillemotright
+guilsinglleft guilsinglright quotedbl quotesingle""".split()
+SYMBOLS = """cent currency dollar euro sterling yen florin plus minus multiply divide equal notequal
+greater less greaterequal lessequal plusminus approxequal asciitilde logicalnot asciicircum
+infinity percent perthousand at ampersand paragraph section copyright registered trademark degree
+bar brokenbar dagger daggerdbl""".split()
+SPECIAL_BASE = {"Eth": "D", "eth": "d", "germandbls": "s", "Germandbls": "S"}
+
+def glyphs_like_order(font):
+    order = font.getGlyphOrder()
+    unicodes = {}
+    for cp, name in sorted(font.getBestCmap().items()):
+        unicodes.setdefault(name, cp)
+
+    def base_letter(name, cp):
+        if name in SPECIAL_BASE:
+            return SPECIAL_BASE[name]
+        decomposed = unicodedata.normalize("NFD", chr(cp))[0]
+        if decomposed.isascii() and decomposed.isalpha():
+            return decomposed
+        return name[0]
+
+    info = {}
+    for name in order:
+        cp = unicodes.get(name)
+        info[name] = cp
+
+    def key_for(name, cp, rank=0):
+        if name == ".notdef":
+            return (0,)
+        if cp is None:
+            # alternative: subito dopo il glifo da cui deriva
+            base = name.split(".")[0]
+            if base != name and info.get(base) is not None:
+                return key_for(base, info[base]) + (9, name)
+            return (90, name)
+        ch = chr(cp)
+        cat = unicodedata.category(ch)
+        if cat in ("Lu", "Ll", "Lt"):
+            letter = base_letter(name, cp)
+            group = 10 if cat != "Ll" else 20
+            if not letter.isascii():
+                group += 5
+            if name == letter or ch == letter:
+                sub = 0
+            elif unicodedata.normalize("NFD", ch)[0] == letter:
+                sub = 1
+            else:
+                sub = 2
+            return (group, letter.upper(), sub, name, 0)
+        if cat[0] == "L":
+            return (30, cp, name, 0)
+        if cat == "Nd":
+            return (40, cp, name, 0)
+        if cat[0] == "N":
+            return (41, cp, name, 0)
+        if cat[0] == "Z" or cat == "Cc":
+            return (50, cp, name, 0)
+        if name in SYMBOLS:
+            return (70, SYMBOLS.index(name), name, 0)
+        if cat[0] == "P":
+            rank = PUNCTUATION.index(name) if name in PUNCTUATION else 1000 + cp
+            return (60, rank, name, 0)
+        if cat in ("Sc", "Sm", "So"):
+            rank = SYMBOLS.index(name) if name in SYMBOLS else 1000 + cp
+            return (70, rank, name, 0)
+        if cat[0] == "M":
+            return (80, cp, name, 0)
+        if cat == "Sk":
+            return (81, cp, name, 0)
+        return (85, cp, name, 0)
+
+    return sorted(order, key=lambda n: key_for(n, info[n]))
+
+def reorder_font(font, new_order):
+    font.ensureDecompiled()
+    charstrings = {}
+    for tag in ("CFF ", "CFF2"):
+        if tag in font:
+            cs = font[tag].cff.topDictIndex[0].CharStrings
+            charstrings = {n: cs[n] for n in font.getGlyphOrder()}
+            for c in charstrings.values():
+                c.decompile()
+    reorderGlyphs(font, new_order)
+    for tag in ("CFF ", "CFF2"):
+        if tag in font:
+            cff = font[tag].cff
+            top = cff.topDictIndex[0]
+            cs = top.CharStrings
+            top.charset = list(new_order)
+            cs.charStrings = {n: i for i, n in enumerate(new_order)}
+            cs.charStringsIndex.items = [charstrings[n] for n in new_order]
+            cff.otFont = font
+
+def outlines(font):
+    glyph_set = font.getGlyphSet()
+    result = {}
+    for name in font.getGlyphOrder():
+        pen = RecordingPen()
+        glyph_set[name].draw(pen)
+        result[name] = (pen.value, glyph_set[name].width)
+    return result
+
+def run(in_path, out_path):
+    with open(in_path, "rb") as f:
+        data = f.read()
+    original = TTFont(io.BytesIO(data))
+    before_order = original.getGlyphOrder()
+    before = outlines(original)
+    new_order = glyphs_like_order(original)
+    font = TTFont(io.BytesIO(data))
+    reorder_font(font, new_order)
+    out = io.BytesIO()
+    font.save(out)
+    result = out.getvalue()
+    check = TTFont(io.BytesIO(result))
+    after = outlines(check)
+    different = [n for n in before_order if before[n] != after.get(n)]
+    # varianti: le prime istanze del font variabile, se ci sono
+    instances_checked = 0
+    if "fvar" in original:
+        from fontTools.varLib.instancer import instantiateVariableFont
+        instances = original["fvar"].instances
+        # il primo e l'ultimo stile (di solito gli estremi): bastano per i dati delle variazioni
+        for instance in [instances[0], instances[-1]] if len(instances) > 1 else instances:
+            a = instantiateVariableFont(TTFont(io.BytesIO(data)), dict(instance.coordinates))
+            b = instantiateVariableFont(TTFont(io.BytesIO(result)), dict(instance.coordinates))
+            oa, ob = outlines(a), outlines(b)
+            different += [n for n in before_order if oa[n] != ob.get(n) and n not in different]
+            instances_checked += 1
+    cmap = check.getBestCmap()
+    chars = {}
+    for cp, name in cmap.items():
+        chars.setdefault(name, cp)
+    with open(out_path, "wb") as f:
+        f.write(result)
+    return json.dumps({
+        "order": list(check.getGlyphOrder()),
+        "chars": {n: chars[n] for n in chars},
+        "before": before_order,
+        "different": different,
+        "instances": instances_checked,
+    })
+`;
+
+let pyodidePromise = null;
+
+async function loadFontTools(onStatus) {
+  if (!pyodidePromise) {
+    pyodidePromise = (async () => {
+      const urls = window.__prepareExportPyodideURLs || PYODIDE_URLS;
+      let lastError = null;
+      for (const url of urls) {
+        try {
+          onStatus?.("Scarico Python (Pyodide)… la prima volta ci vuole un po'.");
+          const module = await import(/* webpackIgnore: true */ `${url}pyodide.mjs`);
+          const pyodide = await module.loadPyodide({ indexURL: url });
+          onStatus?.("Scarico fontTools…");
+          await pyodide.loadPackage("fonttools", window.__prepareExportCheckIntegrity === false ? { checkIntegrity: false } : undefined);
+          await pyodide.runPythonAsync(REORDER_PY);
+          return pyodide;
+        } catch (error) {
+          console.warn("[Prepara export] Pyodide da", url, error);
+          lastError = error;
+        }
+      }
+      throw lastError || new Error("Pyodide non disponibile");
+    })();
+    pyodidePromise.catch(() => (pyodidePromise = null));
+  }
+  return pyodidePromise;
+}
+
+const REORDER_CSS = `
+  :host { all: initial; }
+  .overlay {
+    position: fixed; inset: 0; z-index: 1000; background: #0006;
+    display: flex; align-items: center; justify-content: center;
+    font-family: fontra-ui-regular, -apple-system, system-ui, sans-serif; font-size: 12px;
+  }
+  .box {
+    background: var(--ui-element-background-color, #fff); color: var(--ui-element-foreground-color, #222);
+    border-radius: 10px; box-shadow: 0 10px 40px #0006; width: min(760px, 95vw); max-height: 90vh;
+    display: flex; flex-direction: column;
+  }
+  .head { display: flex; align-items: center; gap: 8px; padding: 12px 16px 4px; }
+  .head b { font-size: 14px; }
+  .head .x { margin-left: auto; border: none; font-size: 18px; opacity: 0.6; padding: 0 6px; }
+  .content { overflow: auto; padding: 0 16px 10px; }
+  .foot { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid #8883; }
+  .foot .msg { flex: 1; opacity: 0.85; }
+  p { margin: 4px 0 8px; line-height: 1.45; opacity: 0.85; }
+  .status { margin: 8px 0; min-height: 1.4em; }
+  .status.error { color: #c92a2a; }
+  .status.ok { color: #15803d; }
+  .chars { font-size: 15px; line-height: 1.6; word-break: break-all; border-radius: 6px; background: #8881; padding: 6px 9px; max-height: 150px; overflow: auto; }
+  .chars .n { font-size: 10.5px; opacity: 0.55; }
+  h4 { font-size: 12px; margin: 12px 0 4px; }
+  button, .file {
+    font: inherit; color: inherit; border-radius: 5px; border: 1px solid #8884;
+    background: transparent; padding: 3px 9px; cursor: pointer;
+  }
+  button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  input[type=file] { display: none; }
+`;
+
+class ReorderDialogElement extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this.shadowRoot.innerHTML = `
+      <style>${REORDER_CSS}</style>
+      <div class="overlay">
+        <div class="box">
+          <div class="head"><b>Riordina i glifi di un font esportato</b><button class="x" id="close" title="Chiudi (Esc)">×</button></div>
+          <div class="content">
+            <p>L'export di Fontra mette i glifi in ordine alfabetico per nome, e Illustrator li mostra così nel pannello Glifi. ` +
+      `Scegli il font esportato (.otf o .ttf): il plugin lo riordina come farebbe Glyphs (maiuscole, ognuna con le sue accentate, ` +
+      `poi minuscole, numeri, punteggiatura, simboli e accenti) e ti dà un file nuovo da installare al posto del vecchio.</p>
+            <p>Forme, larghezze, kerning e funzioni OpenType restano identici. Prima di darti il file il plugin controlla forme e larghezze glifo per glifo, anche negli stili estremi.</p>
+            <label class="file" id="pick">Scegli il font esportato…<input type="file" id="file" accept=".otf,.ttf,font/otf,font/ttf"></label>
+            <div class="status" id="status"></div>
+            <div id="preview"></div>
+          </div>
+          <div class="foot"><span class="msg" id="msg"></span><button id="cancel">Chiudi</button><button class="primary" id="save" disabled>Scarica il font riordinato</button></div>
+        </div>
+      </div>`;
+    this.$ = (sel) => this.shadowRoot.querySelector(sel);
+  }
+}
+if (!customElements.get(REORDER_TAG)) customElements.define(REORDER_TAG, ReorderDialogElement);
+
+class ReorderDialog {
+  open() {
+    this.element = document.createElement(REORDER_TAG);
+    document.body.appendChild(this.element);
+    const $ = this.element.$;
+    const close = () => this.close();
+    $("#close").addEventListener("click", close);
+    $("#cancel").addEventListener("click", close);
+    $(".overlay").addEventListener("pointerdown", (event) => {
+      if (event.target === $(".overlay")) close();
+    });
+    this.element.addEventListener("keydown", (event) => event.stopPropagation());
+    this.onKey = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      close();
+    };
+    window.addEventListener("keydown", this.onKey, true);
+    $("#file").addEventListener("change", () => {
+      const file = $("#file").files?.[0];
+      if (file) this.process(file);
+    });
+    $("#save").addEventListener("click", () => this.save());
+    // fontTools si comincia a scaricare subito, mentre scegli il file
+    loadFontTools((text) => this.status(text)).then(
+      () => this.status(this.result ? this.statusText : "Pronto: scegli il font esportato."),
+      (error) => this.status(`Non riesco a caricare fontTools: ${error?.message || error}. Serve la connessione a internet.`, "error")
+    );
+    return this;
+  }
+
+  close() {
+    window.removeEventListener("keydown", this.onKey, true);
+    this.element?.remove();
+    this.element = null;
+  }
+
+  status(text, kind = "") {
+    if (!this.element) return;
+    const el = this.element.$("#status");
+    el.textContent = text;
+    el.className = `status ${kind}`;
+  }
+
+  async process(file) {
+    const $ = this.element.$;
+    $("#save").disabled = true;
+    $("#preview").innerHTML = "";
+    this.result = null;
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      const pyodide = await loadFontTools((text) => this.status(text));
+      this.status(`Riordino ${file.name}…`);
+      await sleep(30);
+      pyodide.FS.writeFile("/tmp/font-in", data);
+      const run = pyodide.globals.get("run");
+      const infoText = run("/tmp/font-in", "/tmp/font-out");
+      run.destroy?.();
+      const bytes = pyodide.FS.readFile("/tmp/font-out");
+      const info = JSON.parse(infoText);
+      if (info.different.length) {
+        this.status(`Qualcosa non torna: ${info.different.length} glifi cambiano forma riordinando (${info.different.slice(0, 8).join(", ")}). Non ti do il file.`, "error");
+        return;
+      }
+      this.result = { name: file.name, bytes: new Uint8Array(bytes), info };
+      const moved = info.order.filter((n, i) => info.before[i] !== n).length;
+      this.statusText =
+        `Fatto: ${plural(info.order.length, "glifo", "glifi")}, ${moved} in una posizione nuova. ` +
+        `Forme e larghezze controllate: identiche${info.instances ? `, anche negli stili ${info.instances === 1 ? "variabili" : "estremi"}` : ""}.`;
+      this.status(this.statusText, "ok");
+      $("#preview").innerHTML =
+        `<h4>Prima (come lo esporta Fontra)</h4><div class="chars">${this.charsHTML(info.before, info.chars)}</div>` +
+        `<h4>Dopo</h4><div class="chars">${this.charsHTML(info.order, info.chars)}</div>`;
+      $("#save").disabled = false;
+    } catch (error) {
+      console.error("[Prepara export]", error);
+      this.status(`Non è stato possibile riordinare il font: ${error?.message || error}`, "error");
+    }
+  }
+
+  charsHTML(order, chars) {
+    return order
+      .map((name) => {
+        const cp = chars[name];
+        if (name === ".notdef") return "";
+        if (cp === undefined) return `<span class="n">/${escapeHTML(name)}</span>`;
+        if (cp === 0x20) return `<span class="n">␣</span>`;
+        return escapeHTML(String.fromCodePoint(cp));
+      })
+      .join(" ");
+  }
+
+  save() {
+    if (!this.result) return;
+    const { name, bytes } = this.result;
+    const type = /\.ttf$/i.test(name) ? "font/ttf" : "font/otf";
+    const url = URL.createObjectURL(new Blob([bytes], { type }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    this.element.$("#msg").textContent = `Salvato «${name}» nei Download. Installalo al posto di quello vecchio.`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Menu: File → Prepara per l'export… (panoramica) / Controlla il font… (editor)
 // ---------------------------------------------------------------------------
 
-async function addToFileMenu(title, callback) {
+async function addToFileMenu(entries) {
   for (let i = 0; i < 100; i++) {
     const menuBar = document.querySelector(".top-bar-container menu-bar") || document.querySelector("menu-bar");
     const items = menuBar?.items;
@@ -1515,7 +1902,7 @@ async function addToFileMenu(title, callback) {
       fileMenu.getItems = () => [
         ...(original?.() || []),
         { title: "-" },
-        { title, enabled: () => true, callback },
+        ...entries.map(({ title, callback }) => ({ title, enabled: () => true, callback })),
       ];
       return;
     }
@@ -1561,7 +1948,10 @@ class PrepareExportEditor {
     this.editor = editor;
     this.fc = editor.fontController;
     this.sc = editor.sceneController;
-    addToFileMenu(MENU_TITLE_EDITOR, () => this.openDialog());
+    addToFileMenu([
+      { title: MENU_TITLE_EDITOR, callback: () => this.openDialog() },
+      { title: MENU_TITLE_REORDER, callback: () => new ReorderDialog().open() },
+    ]);
     this.linkOverviewWindows();
   }
 
@@ -1648,7 +2038,10 @@ class PrepareExportOverview {
   constructor(controller) {
     this.controller = controller;
     this.fc = controller.fontController;
-    addToFileMenu(MENU_TITLE, () => this.openDialog());
+    addToFileMenu([
+      { title: MENU_TITLE, callback: () => this.openDialog() },
+      { title: MENU_TITLE_REORDER, callback: () => new ReorderDialog().open() },
+    ]);
     this.installChunkedUndo();
   }
 
@@ -1725,6 +2118,9 @@ export function startOverview(controller) {
 export {
   FontAnalyzer,
   PrepareExportDialog,
+  ReorderDialog,
+  loadFontTools,
+  REORDER_PY,
   planChanges,
   readContours,
   packContours,

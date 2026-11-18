@@ -9,12 +9,14 @@ Plugin per [Fontra](https://fontra.xyz). Prima di esportare il font controlla tu
 
 Non cambia niente finché non premi **Applica**, e tutto si annulla con ⌘Z.
 
+Dopo l'export, **riordina i glifi del font esportato** come li ordinerebbe Glyphs, così nel pannello Glifi di Illustrator non sono più in ordine alfabetico per nome.
+
 ## Installazione
 
 In Fontra: **Fontra → Plugin Manager → +**, e incolla:
 
 ```
-https://cdn.jsdelivr.net/gh/<utente>/fontra-prepare-export@v1.0.0
+https://cdn.jsdelivr.net/gh/<utente>/fontra-prepare-export@v1.1.0
 ```
 
 Poi ricarica l'editor. Per aggiornare a una versione nuova togli l'indirizzo vecchio, aggiungi quello nuovo e ricarica.
@@ -61,7 +63,34 @@ Queste cose il plugin non le cambia. Clicca il nome di un glifo per aprirlo. Cli
 - **Ancore diverse tra i master.**
 - **Glifi che non finiranno nel font.** L'export di Fontra lascia fuori i glifi che non hanno un carattere, non sono usati da nessuna funzione OpenType e non sono usati come componente. Per esempio le alternative `.001`, `.002` quando non c'è una funzione `ss01` o `salt` che le usa.
 
+- **Valori degli assi senza nome.** Un valore dell'asse senza nome (per esempio width 100) finisce nel font come un nome vuoto. In **Font Info → Axes** scrivi un nome (per il valore predefinito di solito **Normal**) e spunta **Elidable**: i nomi degli stili restano uguali.
+
 **Copia resoconto** copia tutto come testo, da incollare dove vuoi.
+
+## Riordinare i glifi dopo l'export
+
+L'export di Fontra mette i glifi in ordine alfabetico per nome: A, AE, AEacute, Aacute…, poi a, aacute, ampersand…, con la eight in mezzo alle e. Il pannello **Glifi** di Illustrator (Mostra: Font intero) li mostra in quell'ordine. In Fontra non si può cambiare: l'export riordina sempre per nome e ignora anche un ordine personalizzato (`public.glyphOrder`).
+
+Quindi si riordina il file già esportato:
+
+1. **File → Riordina i glifi di un font esportato…** (c'è sia nella panoramica sia nell'editor).
+2. **Scegli il font esportato…**: un `.otf` o un `.ttf`.
+3. Il plugin mostra l'ordine di prima e quello nuovo, controlla che forme e larghezze siano identiche glifo per glifo (anche negli stili estremi) e poi abilita **Scarica il font riordinato**. Il file nuovo ha lo stesso nome e va nei Download.
+4. Disinstalla il font vecchio e installa quello nuovo.
+
+L'ordine è quello di Glyphs:
+- le maiuscole, ognuna seguita dalle sue accentate (A Á Ă … Æ, B, C Ć Č Ç…);
+- le minuscole, allo stesso modo;
+- ª º, i numeri, lo spazio;
+- la punteggiatura (. , : ; … ! ¡ ? ¿ · • * # / \ ( ) { } [ ] - – — _ e le virgolette);
+- i simboli (valute, segni matematici, % ‰ @ & § © ® ™ ° |);
+- gli accenti.
+
+Il riordino lo fa **fontTools**, che gira nel browser con [Pyodide](https://pyodide.org). La prima volta il plugin scarica circa 13 MB, che poi restano nella cache del browser. Serve la connessione a internet. Forme, larghezze, kerning e funzioni OpenType non cambiano: cambia solo la posizione dei glifi nel file.
+
+### E l'ordine degli stili?
+
+Nel font esportato gli stili sono già in ordine: Light Narrow, Light, Light Wide, Regular Narrow, Regular, Regular Wide, Bold Narrow, Bold, Bold Wide. Illustrator però mette in cima lo stile di partenza del font variabile (Regular) e subito sotto quello selezionato. Gli altri restano nell'ordine giusto. È un comportamento delle app Adobe, e il font non può cambiarlo.
 
 ## Perché `.otf` e non `.ttf`
 
@@ -75,7 +104,9 @@ In TrueType (`.ttf`) le curve vengono convertite da cubiche a quadratiche. È un
 - **Contorni.** Dopo l'unione, i contorni esterni girano in senso antiorario, come nel formato PostScript/CFF.
 - **Modifiche e annullamento.** Le modifiche partono a blocchi di 40 glifi: il server tiene in memoria 128 glifi per volta. Anche l'annullamento con ⌘Z va a blocchi. Si applica solo nella panoramica, dove ⌘Z vale per tutto il font.
 - **Glifi non esportati.** Per le funzioni OpenType il plugin cerca soltanto i nomi dei glifi nel testo delle funzioni.
+- **Riordino.** Usa Pyodide 0.29.5 da cdn.jsdelivr.net (con 0.29.3 e 0.27.7 di riserva) e `fontTools.ttLib.reorderGlyphs`. Nei font CFF/CFF2 il plugin rimette in ordine anche il `charset` e le `CharStrings`, che `reorderGlyphs` lascia com'erano.
 
 ## Versioni
 
+- **1.1.0**: nuovo comando **Riordina i glifi di un font esportato…**; nuovo avviso per i valori degli assi senza nome.
 - **1.0.0**: prima versione.
